@@ -53,23 +53,60 @@ int32_t BleGpsModule::runOnce()
     // Check if GPS has valid position before attempting to send
 #if HAS_GPS
     bool hasValidGpsPosition = false;
-    if (gpsStatus && gpsStatus->getHasLock()) {
+    bool gpsHasLock = false;
+    bool hasFixedPosition = false;
+    bool hasPositionInNodeDB = false;
+    
+    if (gpsStatus) {
+        gpsHasLock = gpsStatus->getHasLock();
+        LOG_DEBUG("BleGpsModule: GPS status - hasLock=%d", gpsHasLock);
+    } else {
+        LOG_DEBUG("BleGpsModule: gpsStatus is NULL");
+    }
+    
+    if (gpsHasLock) {
         hasValidGpsPosition = true;
+        LOG_DEBUG("BleGpsModule: GPS has lock, will try to send position");
     } else {
         // Check if we have fixed position configured
-        if (config.position.fixed_position) {
+        hasFixedPosition = config.position.fixed_position;
+        if (hasFixedPosition) {
             hasValidGpsPosition = true;
+            LOG_DEBUG("BleGpsModule: Fixed position configured, will try to send");
+        } else {
+            // Check if we have any position in nodeDB (even old one)
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
+            if (node && node->has_position && 
+                node->position.latitude_i != 0 && node->position.longitude_i != 0) {
+                hasPositionInNodeDB = true;
+                hasValidGpsPosition = true;
+                LOG_DEBUG("BleGpsModule: Found position in nodeDB (last known position), will try to send");
+            } else {
+                LOG_DEBUG("BleGpsModule: No GPS lock, no fixed position, and no position in nodeDB");
+            }
         }
     }
     
+    // Check time since last send
+    uint32_t timeSinceLastSend = (lastSentToPhone == 0) ? UINT32_MAX : (now - lastSentToPhone);
+    LOG_DEBUG("BleGpsModule: Time since last send: %u ms (interval: %u ms)", timeSinceLastSend, sendIntervalMs);
+    
     // Only send if we have valid GPS position and enough time has passed
-    if (hasValidGpsPosition && ((lastSentToPhone == 0) || ((now - lastSentToPhone) >= sendIntervalMs))) {
+    if (hasValidGpsPosition && ((lastSentToPhone == 0) || (timeSinceLastSend >= sendIntervalMs))) {
+        LOG_INFO("BleGpsModule: Calling sendPositionToPhone()");
         sendPositionToPhone();
         lastSentToPhone = now;
+    } else {
+        if (!hasValidGpsPosition) {
+            LOG_DEBUG("BleGpsModule: Skipping send - no valid GPS position");
+        } else {
+            LOG_DEBUG("BleGpsModule: Skipping send - not enough time passed (%u < %u)", timeSinceLastSend, sendIntervalMs);
+        }
     }
 #else
     // If GPS is excluded, check if we have fixed position
     if (config.position.fixed_position && ((lastSentToPhone == 0) || ((now - lastSentToPhone) >= sendIntervalMs))) {
+        LOG_INFO("BleGpsModule: Calling sendPositionToPhone() (fixed position, no GPS)");
         sendPositionToPhone();
         lastSentToPhone = now;
     }
@@ -81,14 +118,21 @@ int32_t BleGpsModule::runOnce()
 
 void BleGpsModule::sendPositionToPhone()
 {
+    LOG_DEBUG("BleGpsModule: sendPositionToPhone() called");
+    
     // Check if we have a valid GPS position or fixed position configured
 #if HAS_GPS
     bool hasValidPosition = false;
     if (config.position.fixed_position) {
         // Fixed position is always valid
         hasValidPosition = true;
+        LOG_DEBUG("BleGpsModule: Fixed position is configured");
     } else if (gpsStatus && gpsStatus->getHasLock()) {
         hasValidPosition = true;
+        LOG_DEBUG("BleGpsModule: GPS has lock");
+    } else {
+        LOG_DEBUG("BleGpsModule: No GPS lock (gpsStatus=%p, hasLock=%d)", gpsStatus, 
+                  (gpsStatus ? gpsStatus->getHasLock() : 0));
     }
     
     if (!hasValidPosition) {
@@ -104,9 +148,14 @@ void BleGpsModule::sendPositionToPhone()
 #endif
 
     // Get current position
+    LOG_DEBUG("BleGpsModule: Getting current position...");
     meshtastic_Position position = getCurrentPosition();
     
     // Check if position is valid
+    LOG_DEBUG("BleGpsModule: Position check - has_latitude_i=%d, has_longitude_i=%d, lat=%d, lon=%d", 
+              position.has_latitude_i, position.has_longitude_i, 
+              position.latitude_i, position.longitude_i);
+    
     if (!position.has_latitude_i || !position.has_longitude_i) {
         LOG_DEBUG("BleGpsModule: No valid position data, skipping send");
         return;
