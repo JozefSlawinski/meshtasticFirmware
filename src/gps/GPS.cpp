@@ -1521,6 +1521,12 @@ bool GPS::lookForTime()
     auto ti = reader.time;
     auto d = reader.date;
     if (ti.isValid() && d.isValid()) { // Note: we don't check for updated, because we'll only be called if needed
+        // Only accept time from GPS if we have a valid fix
+        // GPS modules may report invalid dates when they don't have a proper fix yet
+        if (!hasLock()) {
+            LOG_DEBUG("GPS time rejected: no valid fix (fixQual=%d)", fixQual);
+            return false;
+        }
         /* Convert to unix time
 The Unix epoch (or Unix time or POSIX time or Unix timestamp) is the number of seconds that have elapsed since January 1,
 1970 (midnight UTC/GMT), not counting leap seconds (in ISO 8601: 1970-01-01T00:00:00Z).
@@ -1533,6 +1539,52 @@ The Unix epoch (or Unix time or POSIX time or Unix timestamp) is the number of s
         t.tm_mon = d.month() - 1;
         t.tm_year = d.year() - 1900;
         t.tm_isdst = false;
+        
+        // Validate parsed date values before attempting to set RTC
+        // Check for reasonable year range (2020-2050) to catch corrupted GPS data
+        int year = d.year();
+        if (year < 2020 || year > 2050) {
+            LOG_WARN("GPS date validation failed: year %d is out of reasonable range (2020-2050). Raw date: %04d-%02d-%02d %02d:%02d:%02d (fixQual=%d, sats=%d)", 
+                     year, d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second(), 
+                     fixQual, reader.satellites.value());
+            return false;
+        }
+        
+        // Validate month (1-12)
+        if (d.month() < 1 || d.month() > 12) {
+            LOG_WARN("GPS date validation failed: invalid month %d. Raw date: %04d-%02d-%02d %02d:%02d:%02d", 
+                     d.month(), d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second());
+            return false;
+        }
+        
+        // Validate day (1-31, basic check)
+        if (d.day() < 1 || d.day() > 31) {
+            LOG_WARN("GPS date validation failed: invalid day %d. Raw date: %04d-%02d-%02d %02d:%02d:%02d", 
+                     d.day(), d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second());
+            return false;
+        }
+        
+        // Validate hour (0-23)
+        if (ti.hour() > 23) {
+            LOG_WARN("GPS date validation failed: invalid hour %d. Raw date: %04d-%02d-%02d %02d:%02d:%02d", 
+                     ti.hour(), d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second());
+            return false;
+        }
+        
+        // Validate minute (0-59)
+        if (ti.minute() > 59) {
+            LOG_WARN("GPS date validation failed: invalid minute %d. Raw date: %04d-%02d-%02d %02d:%02d:%02d", 
+                     ti.minute(), d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second());
+            return false;
+        }
+        
+        // Validate second (0-59, accounting for leap seconds)
+        if (ti.second() > 60) {
+            LOG_WARN("GPS date validation failed: invalid second %d. Raw date: %04d-%02d-%02d %02d:%02d:%02d", 
+                     ti.second(), d.year(), d.month(), d.day(), ti.hour(), ti.minute(), ti.second());
+            return false;
+        }
+        
         if (t.tm_mon > -1) {
             LOG_DEBUG("NMEA GPS time %02d-%02d-%02d %02d:%02d:%02d age %d", d.year(), d.month(), t.tm_mday, t.tm_hour, t.tm_min,
                       t.tm_sec, ti.age());
