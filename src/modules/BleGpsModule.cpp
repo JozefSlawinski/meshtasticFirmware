@@ -1,0 +1,254 @@
+#if !MESHTASTIC_EXCLUDE_GPS && !MESHTASTIC_EXCLUDE_BLUETOOTH
+#include "BleGpsModule.h"
+#include "Default.h"
+#include "GPS.h"
+#include "GPSStatus.h"
+#include "MeshService.h"
+#include "NodeDB.h"
+#include "RTC.h"
+#include "TypeConversions.h"
+#include "configuration.h"
+#include "main.h"
+
+BleGpsModule *bleGpsModule;
+
+BleGpsModule::BleGpsModule()
+    : ProtobufModule("blegps", meshtastic_PortNum_POSITION_APP, &meshtastic_Position_msg),
+      concurrency::OSThread("BleGpsModule")
+{
+    // Set initial delay before first execution to allow system to initialize
+    setIntervalFromNow(setStartDelay());
+    
+    LOG_INFO("========================================");
+    LOG_INFO("BleGpsModule: INITIALIZED");
+    LOG_INFO("BleGpsModule: Will send position to phone every %d ms", sendIntervalMs);
+    LOG_INFO("========================================");
+}
+
+bool BleGpsModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_Position *p)
+{
+    // We don't need to handle incoming position packets for this module
+    // Let other modules (like PositionModule) handle them
+    // Return false to allow other modules to process this message
+    return false;
+}
+
+int32_t BleGpsModule::runOnce()
+{
+    // Debug: Log first execution
+    static bool firstRun = true;
+    if (firstRun) {
+        LOG_INFO("BleGpsModule: runOnce() called for the first time");
+        firstRun = false;
+    }
+    
+    // Check if enough time has passed since last send
+    uint32_t now = millis();
+    
+    // Handle millis() wrap-around (happens after ~49 days)
+    if (lastSentToPhone > now) {
+        lastSentToPhone = 0;
+    }
+    
+    // Check if GPS has valid position before attempting to send
+#if HAS_GPS
+    bool hasValidGpsPosition = false;
+    bool gpsHasLock = false;
+    bool hasFixedPosition = false;
+    bool hasPositionInNodeDB = false;
+    
+    if (gpsStatus) {
+        gpsHasLock = gpsStatus->getHasLock();
+        LOG_DEBUG("BleGpsModule: GPS status - hasLock=%d", gpsHasLock);
+    } else {
+        LOG_DEBUG("BleGpsModule: gpsStatus is NULL");
+    }
+    
+    if (gpsHasLock) {
+        hasValidGpsPosition = true;
+        LOG_DEBUG("BleGpsModule: GPS has lock, will try to send position");
+    } else {
+        // Check if we have fixed position configured
+        hasFixedPosition = config.position.fixed_position;
+        if (hasFixedPosition) {
+            hasValidGpsPosition = true;
+            LOG_DEBUG("BleGpsModule: Fixed position configured, will try to send");
+        } else {
+            // Check if we have any position in nodeDB (even old one)
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
+            if (node && node->has_position && 
+                node->position.latitude_i != 0 && node->position.longitude_i != 0) {
+                hasPositionInNodeDB = true;
+                hasValidGpsPosition = true;
+                LOG_DEBUG("BleGpsModule: Found position in nodeDB (last known position), will try to send");
+            } else {
+                LOG_DEBUG("BleGpsModule: No GPS lock, no fixed position, and no position in nodeDB");
+            }
+        }
+    }
+    
+    // Check time since last send
+    uint32_t timeSinceLastSend = (lastSentToPhone == 0) ? UINT32_MAX : (now - lastSentToPhone);
+    LOG_DEBUG("BleGpsModule: Time since last send: %u ms (interval: %u ms)", timeSinceLastSend, sendIntervalMs);
+    
+    // Only send if we have valid GPS position and enough time has passed
+    if (hasValidGpsPosition && ((lastSentToPhone == 0) || (timeSinceLastSend >= sendIntervalMs))) {
+        LOG_INFO("BleGpsModule: Calling sendPositionToPhone()");
+        sendPositionToPhone();
+        lastSentToPhone = now;
+    } else {
+        if (!hasValidGpsPosition) {
+            LOG_DEBUG("BleGpsModule: Skipping send - no valid GPS position");
+        } else {
+            LOG_DEBUG("BleGpsModule: Skipping send - not enough time passed (%u < %u)", timeSinceLastSend, sendIntervalMs);
+        }
+    }
+#else
+    // If GPS is excluded, check if we have fixed position
+    if (config.position.fixed_position && ((lastSentToPhone == 0) || ((now - lastSentToPhone) >= sendIntervalMs))) {
+        LOG_INFO("BleGpsModule: Calling sendPositionToPhone() (fixed position, no GPS)");
+        sendPositionToPhone();
+        lastSentToPhone = now;
+    }
+#endif
+    
+    // Return interval until next execution
+    return sendIntervalMs;
+}
+
+void BleGpsModule::sendPositionToPhone()
+{
+    LOG_DEBUG("BleGpsModule: sendPositionToPhone() called");
+    
+    // Check if we have a valid GPS position or fixed position configured
+#if HAS_GPS
+    bool hasValidPosition = false;
+    if (config.position.fixed_position) {
+        // Fixed position is always valid
+        hasValidPosition = true;
+        LOG_DEBUG("BleGpsModule: Fixed position is configured");
+    } else if (gpsStatus && gpsStatus->getHasLock()) {
+        hasValidPosition = true;
+        LOG_DEBUG("BleGpsModule: GPS has lock");
+    } else {
+        LOG_DEBUG("BleGpsModule: No GPS lock (gpsStatus=%p, hasLock=%d)", gpsStatus, 
+                  (gpsStatus ? gpsStatus->getHasLock() : 0));
+    }
+    
+    if (!hasValidPosition) {
+        LOG_DEBUG("BleGpsModule: No GPS lock and no fixed position, skipping position send");
+        return;
+    }
+#else
+    // If GPS is excluded, only send if fixed position is configured
+    if (!config.position.fixed_position) {
+        LOG_DEBUG("BleGpsModule: No GPS support and no fixed position, skipping position send");
+        return;
+    }
+#endif
+
+    // Get current position
+    LOG_DEBUG("BleGpsModule: Getting current position...");
+    meshtastic_Position position = getCurrentPosition();
+    
+    // Check if position is valid
+    LOG_DEBUG("BleGpsModule: Position check - has_latitude_i=%d, has_longitude_i=%d, lat=%d, lon=%d", 
+              position.has_latitude_i, position.has_longitude_i, 
+              position.latitude_i, position.longitude_i);
+    
+    if (!position.has_latitude_i || !position.has_longitude_i) {
+        LOG_DEBUG("BleGpsModule: No valid position data, skipping send");
+        return;
+    }
+
+    // Check if phone is connected (queue is not full or empty)
+    if (!service || service->isToPhoneQueueEmpty()) {
+        // Phone might not be connected, but we can still queue the packet
+        // It will be sent when phone connects
+    }
+
+    // Allocate packet with position data
+    meshtastic_MeshPacket *p = allocDataProtobuf(position);
+    if (!p) {
+        LOG_ERROR("BleGpsModule: Failed to allocate position packet");
+        return;
+    }
+
+    // Set packet properties
+    p->to = NODENUM_BROADCAST; // Not required for sendToPhone, but set for consistency
+    p->decoded.want_response = false;
+    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+
+    // Send to phone via BLE
+    service->sendToPhone(p);
+    
+    LOG_DEBUG("BleGpsModule: Sent position to phone - lat=%d, lon=%d, time=%u", 
+              position.latitude_i, position.longitude_i, position.time);
+}
+
+meshtastic_Position BleGpsModule::getCurrentPosition()
+{
+    meshtastic_Position position = meshtastic_Position_init_default;
+    
+#if HAS_GPS
+    // Alternative: use gps->p directly if GPS is active and has lock (as per plan 2.2)
+    if (gps && gpsStatus && gpsStatus->getHasLock()) {
+        // Use position directly from GPS object for most up-to-date data
+        position = gps->p;
+        
+        // Ensure we have latitude and longitude (this also validates the position)
+        if (position.has_latitude_i && position.has_longitude_i) {
+            // Update timestamp if not set - use best available time quality
+            if (position.time == 0) {
+                if (getValidTime(RTCQualityNTP) > 0) {
+                    position.time = getValidTime(RTCQualityNTP);
+                } else if (getValidTime(RTCQualityDevice) > 0) {
+                    position.time = getValidTime(RTCQualityDevice);
+                } else {
+                    position.time = getValidTime(RTCQualityFromNet);
+                }
+            }
+            LOG_DEBUG("BleGpsModule: Using position from GPS object");
+            return position;
+        }
+    }
+#endif
+
+    // Fallback: Get current node info from nodeDB
+    meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    if (!node) {
+        LOG_WARN("BleGpsModule: Could not get local node info");
+        return position;
+    }
+
+    // Check if node has valid position
+    if (!nodeDB->hasValidPosition(node)) {
+        LOG_DEBUG("BleGpsModule: Node does not have valid position");
+        return position;
+    }
+
+    // Copy position from nodeDB - convert from PositionLite to Position
+    position = TypeConversions::ConvertToPosition(node->position);
+    
+    // Ensure we have latitude and longitude
+    if (!position.has_latitude_i || !position.has_longitude_i) {
+        LOG_DEBUG("BleGpsModule: Position missing lat/lon");
+        return position;
+    }
+
+    // Update timestamp if not set - use best available time quality
+    if (position.time == 0) {
+        if (getValidTime(RTCQualityNTP) > 0) {
+            position.time = getValidTime(RTCQualityNTP);
+        } else if (getValidTime(RTCQualityDevice) > 0) {
+            position.time = getValidTime(RTCQualityDevice);
+        } else {
+            position.time = getValidTime(RTCQualityFromNet);
+        }
+    }
+
+    return position;
+}
+
+#endif // !MESHTASTIC_EXCLUDE_GPS && !MESHTASTIC_EXCLUDE_BLUETOOTH
+
